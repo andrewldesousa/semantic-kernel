@@ -27,11 +27,3 @@ class AnthropicChatPromptExecutionSettings(AnthropicPromptExecutionSettings):
     stop_sequences: list[str] | None = None
     top_p: float | None = Field(None, ge=0.0, le=1.0)
     top_k: int | None = Field(None, ge=0)
-
-    @model_validator(mode="after")
-    def check_function_call_behavior(self) -> "AnthropicChatPromptExecutionSettings":
-        """Check if the user is requesting function call behavior."""
-        if self.function_choice_behavior is not None:
-            raise NotImplementedError("Anthropic does not support function call behavior.")
-            
-        return self
