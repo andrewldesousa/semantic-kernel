@@ -21,6 +21,7 @@ from anthropic.types import (
     RawContentBlockDeltaEvent,
     RawMessageDeltaEvent,
     RawMessageStartEvent,
+    RawContentBlockStartEvent,
     TextBlock,
     ToolUseBlock,
 )
@@ -35,10 +36,7 @@ from semantic_kernel.connectors.ai.prompt_execution_settings import PromptExecut
 from semantic_kernel.contents.chat_history import ChatHistory
 from semantic_kernel.contents.chat_message_content import ITEM_TYPES, ChatMessageContent
 from semantic_kernel.contents.function_call_content import FunctionCallContent
-from semantic_kernel.connectors.ai.function_calling_utils import (
-    merge_function_results,
-    # update_settings_from_function_call_configuration,
-)
+from semantic_kernel.connectors.ai.function_calling_utils import merge_function_results
 from semantic_kernel.contents.streaming_chat_message_content import ITEM_TYPES as STREAMING_ITEM_TYPES
 from semantic_kernel.contents.streaming_chat_message_content import StreamingChatMessageContent
 from semantic_kernel.contents.streaming_text_content import StreamingTextContent
@@ -168,7 +166,7 @@ class AnthropicChatCompletion(ChatCompletionClientBase):
             settings.ai_model_id = self.ai_model_id
 
         settings.messages = self._prepare_chat_history_for_request(chat_history)
-    
+
         kernel = kwargs.get("kernel", None)
         if settings.function_choice_behavior is not None:
             if kernel is None:
@@ -183,7 +181,7 @@ class AnthropicChatCompletion(ChatCompletionClientBase):
         # loop for auto-invoke function calls
         for request_index in range(settings.function_choice_behavior.maximum_auto_invoke_attempts):
             completions = await self._send_chat_request(settings)
-            
+
             function_calls = [item for item in completions[0].items if isinstance(item, FunctionCallContent)]
             fc_count = len(function_calls)
             if fc_count == 0:
@@ -207,7 +205,7 @@ class AnthropicChatCompletion(ChatCompletionClientBase):
 
             if any(result.terminate for result in results if result is not None):
                 return merge_function_results(chat_history.messages[-len(results) :])
-            
+
             self._update_settings(settings, chat_history, kernel=kernel)
         else:
             settings.function_choice_behavior.auto_invoke_kernel_functions = False
@@ -253,7 +251,8 @@ class AnthropicChatCompletion(ChatCompletionClientBase):
             all_messages: list[StreamingChatMessageContent] = []
             function_call_returned = False
 
-            settings.messages = self._prepare_chat_history_for_request(chat_history)
+            settings.messages = self._prepare_chat_history_for_request(chat_history, stream=True)
+
             async for messages in self._send_chat_stream_request(settings):
                 for msg in messages:
                     if msg is not None:
@@ -274,28 +273,29 @@ class AnthropicChatCompletion(ChatCompletionClientBase):
 
             full_completion: StreamingChatMessageContent = reduce(lambda x, y: x + y, all_messages)
             function_calls = [item for item in full_completion.items if isinstance(item, FunctionCallContent)]
+            
             chat_history.add_message(message=full_completion)
 
             fc_count = len(function_calls)
             results = await asyncio.gather(
                 *[
-                    self._process_function_call(
+                    kernel.invoke_function_call(
                         function_call=function_call,
                         chat_history=chat_history,
-                        kernel=kernel,
                         arguments=kwargs.get("arguments", None),
                         function_call_count=fc_count,
                         request_index=request_index,
-                        function_call_behavior=settings.function_choice_behavior,
+                        function_behavior=settings.function_choice_behavior,
                     )
                     for function_call in function_calls
                 ],
             )
+
             if any(result.terminate for result in results if result is not None):
                 yield merge_function_results(chat_history.messages[-len(results) :])  # type: ignore
                 break
 
-            self._update_settings(settings, chat_history, kernel=kernel)
+            self._update_settings(settings, chat_history, kernel=kernel, stream=True)
 
     def _create_chat_message_content(
         self, response: Message, content: TextBlock | ToolUseBlock, response_metadata: dict[str, Any]
@@ -388,24 +388,35 @@ class AnthropicChatCompletion(ChatCompletionClientBase):
     ) -> AsyncGenerator[list["StreamingChatMessageContent"], None]:
         """Send the chat stream request."""
 
+
         try:
-            async with self.async_client.messages.stream(**settings.prepare_settings_dict()) as stream:
+            kwargs = settings.model_dump(
+                exclude={
+                    "service_id",
+                    "extension_data",
+                    "messages"
+                },
+                exclude_none=True,
+                by_alias=True,
+            )
+
+            async with self.async_client.messages.stream(messages=settings.messages, **kwargs) as stream:
                 author_role = None
                 metadata: dict[str, Any] = {"usage": {}, "id": None}
                 content_block_idx: int = 0
                 function_call_dict: dict[str, Any] | None = None
 
                 async for stream_event in stream:
-                    if isinstance(stream_event, RawMessageStartEvent):
+                    if isinstance(stream_event, (ContentBlockStartEvent, RawContentBlockStartEvent)) and stream_event.content_block.type == "tool_use":
+                        function_call_dict = {
+                            "id": stream_event.content_block.id,
+                            "name": stream_event.content_block.name,
+                            "arguments": "",
+                        }
+                    elif isinstance(stream_event, RawMessageStartEvent):
                         author_role = stream_event.message.role
                         metadata["usage"]["input_tokens"] = stream_event.message.usage.input_tokens
                         metadata["id"] = stream_event.message.id
-                    elif isinstance(stream_event, ContentBlockStartEvent) and stream_event.type == "tool_use":
-                        function_call_dict = {
-                            "id": stream_event.id,
-                            "name": stream_event.name,
-                            "arguments": "",
-                        }
                     elif isinstance(stream_event, (RawContentBlockDeltaEvent, RawMessageDeltaEvent)):
                         if stream_event.delta and hasattr(stream_event.delta, "partial_json"):
                             function_call_dict["arguments"] += stream_event.delta.partial_json
@@ -424,7 +435,7 @@ class AnthropicChatCompletion(ChatCompletionClientBase):
                             ]
                             function_call_dict = None
 
-                        content_block_idx += 1
+                        # content_block_idx += 1
 
         except Exception as ex:
             raise ServiceResponseException(
@@ -454,17 +465,38 @@ class AnthropicChatCompletion(ChatCompletionClientBase):
         settings: AnthropicChatPromptExecutionSettings,
         chat_history: ChatHistory,
         kernel: "Kernel | None" = None,
+        stream: bool = False,
     ) -> None:
         """Update the settings with the chat history."""
-
         anthropic_messages = []
         for message in chat_history.messages:
             if message.role == AuthorRole.USER:
                 anthropic_messages.append({"role": "user", "content": message.content})
             elif message.role == AuthorRole.ASSISTANT:
                 if message.finish_reason == SemanticKernelFinishReason.TOOL_CALLS:
-                    # add assistent message
-                    anthropic_messages.append({"role": "assistant", "content": message.inner_content.content})
+                    if stream:
+
+                        text_block = TextBlock(
+                            text=str(message),
+                            type="text",
+                        )
+
+                        tool_use_blocks = [
+                            ToolUseBlock(
+                                id=item.id,
+                                name=item.name,
+                                input=item.arguments,
+                                type="tool_use",
+                            )
+                            for item in message.items if isinstance(item, FunctionCallContent)
+                        ]
+
+                        anthropic_messages.append({"role": "assistant", "content": [
+                            text_block,
+                            *tool_use_blocks,
+                        ]})
+                    else:
+                        anthropic_messages.append({"role": "assistant", "content": message.inner_content.content})
                 else:
                     anthropic_messages.append({"role": "assistant", "content": message.content})
             elif message.role == AuthorRole.TOOL:
@@ -483,6 +515,46 @@ class AnthropicChatCompletion(ChatCompletionClientBase):
                 settings=settings,
             )
 
+    def _prepare_chat_history_for_request(self, chat_history: ChatHistory, role_key: str = "role", content_key: str = "content", stream=False) -> Any:
+        anthropic_messages = []
+        for message in chat_history.messages:
+            if message.role == AuthorRole.USER:
+                anthropic_messages.append({"role": "user", "content": message.content})
+            elif message.role == AuthorRole.ASSISTANT:
+                if message.finish_reason == SemanticKernelFinishReason.TOOL_CALLS:
+                    if stream:
+                        text_block = TextBlock(
+                            text=str(message),
+                            type="text",
+                        )
+
+                        tool_use_blocks = [
+                            ToolUseBlock(
+                                id=item.id,
+                                name=item.name,
+                                input=item.arguments if isinstance(item.arguments, dict) else json.loads(item.arguments),
+                                type="tool_use",
+                            )
+                            for item in message.items if isinstance(item, FunctionCallContent)
+                        ]
+
+                        anthropic_messages.append({"role": "assistant", "content": [
+                            text_block,
+                            *tool_use_blocks,
+                        ]})
+                    else:
+                        anthropic_messages.append({"role": "assistant", "content": message.inner_content.content})
+                else:
+                    anthropic_messages.append({"role": "assistant", "content": message.content})
+            elif message.role == AuthorRole.TOOL:
+                # add tool result to previous user message or create a new user message
+                if anthropic_messages and anthropic_messages[-1]["role"] == "user":
+                    anthropic_messages[-1]["content"].append({"type": "tool_result", "tool_use_id": message.items[0].id, "content": str(message.items[0].result)})
+                else:
+                    anthropic_messages.append({"role": "user", "content": [{"type": "tool_result", "tool_use_id": message.items[0].id, "content": str(message.items[0].result)}]})
+
+        return anthropic_messages
+
     def _prepare_settings(
         self,
         settings: AnthropicChatPromptExecutionSettings,
@@ -491,7 +563,7 @@ class AnthropicChatCompletion(ChatCompletionClientBase):
         kernel: "Kernel | None" = None,
     ) -> None:
         """Prepare the prompt execution settings for the chat request."""
-        settings.stream = stream_request
+        # settings.stream = stream_request
         if not settings.ai_model_id:
             settings.ai_model_id = self.ai_model_id
         self._update_settings(settings=settings, chat_history=chat_history, kernel=kernel)

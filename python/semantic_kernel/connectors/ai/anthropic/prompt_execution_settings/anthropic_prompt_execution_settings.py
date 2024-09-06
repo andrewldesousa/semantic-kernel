@@ -21,7 +21,6 @@ class AnthropicChatPromptExecutionSettings(AnthropicPromptExecutionSettings):
     """Specific settings for the Chat Completion endpoint."""
 
     messages: list[dict[str, Any]] | None = None
-    stream: bool | None = None
     system: str | None = None
     max_tokens: int | None = Field(None, gt=0)
     temperature: float | None = Field(None, ge=0.0, le=2.0)
