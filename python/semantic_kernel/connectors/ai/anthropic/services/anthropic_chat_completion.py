@@ -459,7 +459,7 @@ class AnthropicChatCompletion(ChatCompletionClientBase):
                 )
 
         return output
-    
+
     def _update_settings(
         self,
         settings: AnthropicChatPromptExecutionSettings,
@@ -468,45 +468,7 @@ class AnthropicChatCompletion(ChatCompletionClientBase):
         stream: bool = False,
     ) -> None:
         """Update the settings with the chat history."""
-        anthropic_messages = []
-        for message in chat_history.messages:
-            if message.role == AuthorRole.USER:
-                anthropic_messages.append({"role": "user", "content": message.content})
-            elif message.role == AuthorRole.ASSISTANT:
-                if message.finish_reason == SemanticKernelFinishReason.TOOL_CALLS:
-                    if stream:
-
-                        text_block = TextBlock(
-                            text=str(message),
-                            type="text",
-                        )
-
-                        tool_use_blocks = [
-                            ToolUseBlock(
-                                id=item.id,
-                                name=item.name,
-                                input=item.arguments,
-                                type="tool_use",
-                            )
-                            for item in message.items if isinstance(item, FunctionCallContent)
-                        ]
-
-                        anthropic_messages.append({"role": "assistant", "content": [
-                            text_block,
-                            *tool_use_blocks,
-                        ]})
-                    else:
-                        anthropic_messages.append({"role": "assistant", "content": message.inner_content.content})
-                else:
-                    anthropic_messages.append({"role": "assistant", "content": message.content})
-            elif message.role == AuthorRole.TOOL:
-                # add tool result to previous user message or create a new user message
-                if anthropic_messages and anthropic_messages[-1]["role"] == "user":
-                    anthropic_messages[-1]["content"].append({"type": "tool_result", "tool_use_id": message.items[0].id, "content": str(message.items[0].result)})
-                else:
-                    anthropic_messages.append({"role": "user", "content": [{"type": "tool_result", "tool_use_id": message.items[0].id, "content": str(message.items[0].result)}]})
-
-        settings.messages = anthropic_messages
+        settings.messages = self._prepare_chat_history_for_request(chat_history, stream=stream)
 
         if settings.function_choice_behavior and kernel:
             settings.function_choice_behavior.configure(
@@ -517,6 +479,7 @@ class AnthropicChatCompletion(ChatCompletionClientBase):
 
     def _prepare_chat_history_for_request(self, chat_history: ChatHistory, role_key: str = "role", content_key: str = "content", stream=False) -> Any:
         anthropic_messages = []
+
         for message in chat_history.messages:
             if message.role == AuthorRole.USER:
                 anthropic_messages.append({"role": "user", "content": message.content})
@@ -563,10 +526,10 @@ class AnthropicChatCompletion(ChatCompletionClientBase):
         kernel: "Kernel | None" = None,
     ) -> None:
         """Prepare the prompt execution settings for the chat request."""
-        # settings.stream = stream_request
         if not settings.ai_model_id:
             settings.ai_model_id = self.ai_model_id
-        self._update_settings(settings=settings, chat_history=chat_history, kernel=kernel)
+
+        self._update_settings(settings=settings, chat_history=chat_history, kernel=kernel, stream=stream_request)
 
     def get_prompt_execution_settings_class(self) -> "type[AnthropicChatPromptExecutionSettings]":
         """Create a request settings object."""
