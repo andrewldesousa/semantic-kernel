@@ -3,10 +3,9 @@
 import logging
 from typing import Any
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field
 
 from semantic_kernel.connectors.ai.prompt_execution_settings import PromptExecutionSettings
-from semantic_kernel.connectors.ai.function_call_behavior import FunctionCallBehavior
 
 logger = logging.getLogger(__name__)
 
@@ -27,10 +26,9 @@ class AnthropicChatPromptExecutionSettings(AnthropicPromptExecutionSettings):
     stop_sequences: list[str] | None = None
     top_p: float | None = Field(None, ge=0.0, le=1.0)
     top_k: int | None = Field(None, ge=0)
-
-    
     tools: list[dict[str, Any]] | None = Field(
         None,
         max_length=64,
-        description="Do not set this manually. It is set by the service based on the function choice configuration.",
+        description="Do not set this manually." + \
+            "It is set by the service based on the function choice configuration.",
     )

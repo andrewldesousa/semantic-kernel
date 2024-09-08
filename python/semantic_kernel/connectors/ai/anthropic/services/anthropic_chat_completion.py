@@ -37,7 +37,6 @@ from semantic_kernel.contents.chat_history import ChatHistory
 from semantic_kernel.contents.chat_message_content import ITEM_TYPES, ChatMessageContent
 from semantic_kernel.contents.function_call_content import FunctionCallContent
 from semantic_kernel.connectors.ai.function_calling_utils import merge_function_results
-from semantic_kernel.contents.streaming_chat_message_content import ITEM_TYPES as STREAMING_ITEM_TYPES
 from semantic_kernel.contents.streaming_chat_message_content import StreamingChatMessageContent
 from semantic_kernel.contents.streaming_text_content import StreamingTextContent
 from semantic_kernel.contents.text_content import TextContent
@@ -253,12 +252,21 @@ class AnthropicChatCompletion(ChatCompletionClientBase):
 
             settings.messages = self._prepare_chat_history_for_request(chat_history, stream=True)
 
+            is_chain_of_thought_message = False
             async for messages in self._send_chat_stream_request(settings):
                 for msg in messages:
                     if msg is not None:
                         all_messages.append(msg)
                         if any(isinstance(item, FunctionCallContent) for item in msg.items):
                             function_call_returned = True
+
+                # check if <thinking> is present
+                if is_chain_of_thought_message or any(
+                    "<thinking>" in str(msg) for msg in all_messages
+                ):
+                    is_chain_of_thought_message = True
+                    continue
+
                 yield messages
 
             if (
@@ -273,7 +281,6 @@ class AnthropicChatCompletion(ChatCompletionClientBase):
 
             full_completion: StreamingChatMessageContent = reduce(lambda x, y: x + y, all_messages)
             function_calls = [item for item in full_completion.items if isinstance(item, FunctionCallContent)]
-            
             chat_history.add_message(message=full_completion)
 
             fc_count = len(function_calls)
@@ -388,7 +395,6 @@ class AnthropicChatCompletion(ChatCompletionClientBase):
     ) -> AsyncGenerator[list["StreamingChatMessageContent"], None]:
         """Send the chat stream request."""
 
-
         try:
             kwargs = settings.model_dump(
                 exclude={
@@ -403,7 +409,6 @@ class AnthropicChatCompletion(ChatCompletionClientBase):
             async with self.async_client.messages.stream(messages=settings.messages, **kwargs) as stream:
                 author_role = None
                 metadata: dict[str, Any] = {"usage": {}, "id": None}
-                content_block_idx: int = 0
                 function_call_dict: dict[str, Any] | None = None
 
                 async for stream_event in stream:
@@ -423,19 +428,17 @@ class AnthropicChatCompletion(ChatCompletionClientBase):
                         else:
                             yield [
                                 self._create_streaming_chat_message_content(
-                                    stream_event, content_block_idx, author_role, metadata
+                                    stream_event, 0, author_role, metadata
                                 )
                             ]
                     elif isinstance(stream_event, ContentBlockStopEvent):
                         if function_call_dict:
                             yield [
                                 self._create_streaming_chat_message_content(
-                                    stream_event, content_block_idx, author_role, metadata, function_call_dict
+                                    stream_event, 0, author_role, metadata, function_call_dict
                                 )
                             ]
                             function_call_dict = None
-
-                        # content_block_idx += 1
 
         except Exception as ex:
             raise ServiceResponseException(
