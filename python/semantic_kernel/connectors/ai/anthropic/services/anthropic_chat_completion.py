@@ -157,6 +157,8 @@ class AnthropicChatCompletion(ChatCompletionClientBase):
         Returns:
             The completion result(s).
         """
+        import pdb; pdb.set_trace()
+
         if not isinstance(settings, AnthropicChatPromptExecutionSettings):
             settings = self.get_prompt_execution_settings_from_settings(settings)
         assert isinstance(settings, AnthropicChatPromptExecutionSettings)  # nosec
@@ -381,8 +383,14 @@ class AnthropicChatCompletion(ChatCompletionClientBase):
             by_alias=True,
         )
 
-        response = await self.async_client.messages.create(messages=settings.messages, **kwargs)
-        assert isinstance(response, Message)  # nosec
+        try:
+            response = await self.async_client.messages.create(messages=settings.messages, **kwargs)
+            print(response)
+        except Exception as ex:
+            raise ServiceResponseException(
+                f"{type(self)} service failed to complete the request",
+                ex,
+            ) from ex
 
         response_metadata: dict[str, Any] = {"id": response.id }
         if hasattr(response, "usage") and response.usage is not None:

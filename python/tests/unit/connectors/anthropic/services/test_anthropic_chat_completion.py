@@ -2,6 +2,7 @@
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import os
 from anthropic import AsyncAnthropic
 from anthropic.lib.streaming import TextEvent
 from anthropic.types import (
@@ -16,8 +17,10 @@ from anthropic.types import (
     TextBlock,
     TextDelta,
     Usage,
+    ToolUseBlock,
 )
 from anthropic.types.raw_message_delta_event import Delta
+from semantic_kernel.core_plugins.math_plugin import MathPlugin
 
 from semantic_kernel.connectors.ai.anthropic.prompt_execution_settings.anthropic_prompt_execution_settings import (
     AnthropicChatPromptExecutionSettings,
@@ -32,6 +35,7 @@ from semantic_kernel.contents.chat_message_content import ChatMessageContent
 from semantic_kernel.exceptions import ServiceInitializationError, ServiceResponseException
 from semantic_kernel.functions.kernel_arguments import KernelArguments
 from semantic_kernel.kernel import Kernel
+from semantic_kernel.connectors.ai.function_choice_behavior import FunctionChoiceBehavior
 
 
 @pytest.fixture
@@ -61,7 +65,6 @@ def mock_anthropic_client_completion() -> AsyncAnthropic:
     client.messages = messages_mock
 
     return client
-
 
 @pytest.fixture
 def mock_anthropic_client_completion_stream() -> AsyncAnthropic:
@@ -166,19 +169,24 @@ async def test_complete_chat_contents(
     mock_anthropic_client_completion: AsyncAnthropic,
 ):
     chat_history = ChatHistory()
-    chat_history.add_user_message("test_user_message")
     chat_history.add_assistant_message("test_assistant_message")
+    chat_history.add_user_message("test_user_message")
 
     arguments = KernelArguments()
     chat_completion_base = AnthropicChatCompletion(
-        ai_model_id="test_model_id", service_id="test", api_key="", async_client=mock_anthropic_client_completion
+        ai_model_id="test_model_id",
+        service_id="test",
+        api_key="",
+        async_client=mock_anthropic_client_completion
     )
 
     content: list[ChatMessageContent] = await chat_completion_base.get_chat_message_contents(
         chat_history=chat_history, settings=mock_settings, kernel=kernel, arguments=arguments
     )
 
-    assert content is not None
+    assert len(content)
+    anthropic_message = content[0].content
+    assert anthropic_message == "Hello! It's nice to meet you."
 
 
 @pytest.mark.asyncio
@@ -217,17 +225,26 @@ async def test_anthropic_sdk_exception(kernel: Kernel, mock_settings: AnthropicC
     client.messages = messages_mock
 
     chat_completion_base = AnthropicChatCompletion(
-        ai_model_id="test_model_id", service_id="test", api_key="", async_client=client
+        ai_model_id="test_model_id",
+        service_id="test",
+        api_key="",
+        async_client=client
     )
 
     with pytest.raises(ServiceResponseException):
         await chat_completion_base.get_chat_message_contents(
-            chat_history=chat_history, settings=mock_settings, kernel=kernel, arguments=arguments
+            chat_history=chat_history,
+            settings=mock_settings,
+            kernel=kernel,
+            arguments=arguments
         )
 
 
 @pytest.mark.asyncio
-async def test_anthropic_sdk_exception_streaming(kernel: Kernel, mock_settings: AnthropicChatPromptExecutionSettings):
+async def test_anthropic_sdk_exception_streaming(
+    kernel: Kernel,
+    mock_settings: AnthropicChatPromptExecutionSettings
+):
     chat_history = MagicMock()
     arguments = KernelArguments()
     client = MagicMock(spec=AsyncAnthropic)
@@ -317,3 +334,121 @@ async def test_with_different_execution_settings_stream(
     ):
         continue
     assert mock_anthropic_client_completion_stream.messages.stream.call_args.kwargs["temperature"] == 0.2
+
+
+@pytest.mark.asyncio
+async def test_tool_call(
+    kernel: Kernel,
+):
+    mock_anthropic_client_completion = MagicMock(spec=AsyncAnthropic)
+
+    chat_completion_response = AsyncMock()
+    chat_completion_response.content = [
+        TextBlock(
+            text='<thinking>\nTo answer the question "what is 3+3?", the relevant tool is:\n\nmath-Add: This tool takes two integer parameters "input" and "amount" and returns their sum. \n\nThe user has provided the necessary values for both required parameters:\n- input: 3 \n- amount: 3\n\nSo I have all the information needed to call the math-Add tool to answer the question.\n</thinking>',
+            type="text",
+        ),
+        ToolUseBlock(id="toolu_01C6czqhzqPFCJ14297Zm7DM", input={"input": 3, "amount": 3}, name="math-Add", type="tool_use"),
+    ]
+
+    chat_completion_response.id = "test_id"
+    chat_completion_response.model = "claude-3-opus-20240229"
+    chat_completion_response.role = "assistant"
+    chat_completion_response.stop_reason = "tool_use"
+    chat_completion_response.stop_sequence = None
+    chat_completion_response.type = "message"
+    chat_completion_response.usage = Usage(input_tokens=1720, output_tokens=164)
+
+    # Create a MagicMock for the messages attribute
+    messages_mock = MagicMock()
+    messages_mock.create = AsyncMock(return_value=chat_completion_response)
+
+    # Assign the messages_mock to the client.messages attribute
+    mock_anthropic_client_completion.messages = messages_mock
+
+
+    kernel.add_service(AnthropicChatCompletion(
+        service_id="chat", 
+        ai_model_id="claude-3-opus-20240229",
+        api_key="",
+        async_client=mock_anthropic_client_completion
+    ))
+
+    plugins_directory = "../../../../../../../prompt_template_samples/"
+    # adding plugins to the kernel
+    kernel.add_plugin(MathPlugin(), plugin_name="math")
+
+    chat_function = kernel.add_function(
+        prompt="{{$chat_history}}{{$user_input}}",
+        plugin_name="ChatBot",
+        function_name="Chat",
+    )
+
+    execution_settings = AnthropicChatPromptExecutionSettings(
+        service_id="chat",
+        max_tokens=2000,
+        temperature=0.7,
+        top_p=0.8,
+        function_choice_behavior=FunctionChoiceBehavior.Auto(auto_invoke=True),
+    )
+
+
+    history = ChatHistory()
+
+    # history.add_system_message(system_message)
+    history.add_user_message("Hi there, who are you?")
+    history.add_assistant_message("I am Mosscap, a chat bot. I'm trying to figure out what people need.")
+    
+    import pdb; pdb.set_trace()
+    arguments = KernelArguments(settings=execution_settings)
+
+    arguments["user_input"] = "what is 3+3?"
+    arguments["chat_history"] = history
+
+    
+    result = await kernel.invoke(chat_function, arguments=arguments)
+
+
+@pytest.mark.asyncio
+@patch.object(AsyncAnthropic, "create", new_callable=AsyncMock)
+async def test_cmc_run_out_of_auto_invoke_loop(
+    mock_create: MagicMock,
+    kernel: Kernel,
+    chat_history: ChatHistory,
+    mock_chat_completion_response: ChatCompletion,
+    openai_unit_test_env,
+):
+    kernel.add_function("test", kernel_function(lambda key: "test", name="test"))
+    mock_chat_completion_response.choices = [
+        Choice(
+            index=0,
+            message=ChatCompletionMessage(
+                content=None,
+                role="assistant",
+                tool_calls=[
+                    {
+                        "id": "test id",
+                        "function": {"name": "test-test", "arguments": '{"key": "value"}'},
+                        "type": "function",
+                    }
+                ],
+            ),
+            finish_reason="stop",
+        )
+    ]
+    mock_create.return_value = mock_chat_completion_response
+    chat_history.add_user_message("hello world")
+    complete_prompt_execution_settings = OpenAIChatPromptExecutionSettings(
+        service_id="test_service_id", function_choice_behavior="auto"
+    )
+
+    openai_chat_completion = OpenAIChatCompletion()
+    await openai_chat_completion.get_chat_message_contents(
+        chat_history=chat_history,
+        settings=complete_prompt_execution_settings,
+        kernel=kernel,
+        arguments=KernelArguments(),
+    )
+    # call count is the default number of auto_invoke attempts, plus the final completion
+    # when there has not been a answer.
+    mock_create.call_count == 6
